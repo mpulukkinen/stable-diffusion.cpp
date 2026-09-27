@@ -42,16 +42,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10.15.1
-
       - name: Activate ARM64 cross-compile Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -88,8 +78,6 @@ jobs:
           Write-Host "link.exe: $($link.Source)"
           Write-Host "dumpbin.exe: $($dumpbin.Source)"
 
-          # Host tools must be x64 executables. The earlier broken workflow selected
-          # Windows SDK ARM64\rc.exe, which cannot execute on the x64 hosted runner.
           if ($rc.Source -match '\\arm64\\') {
             throw "ARM64 rc.exe selected as a host tool: $($rc.Source)"
           }
@@ -142,14 +130,13 @@ jobs:
             -DSD_OPENCL=ON `
             -DSD_WEBP=OFF `
             -DSD_WEBM=OFF `
+            -DSD_SERVER_BUILD_FRONTEND=OFF `
             -DSD_BUILD_SHARED_LIBS=ON `
             -DSD_BUILD_SHARED_GGML_LIB=ON `
             -DGGML_BACKEND_DL=ON `
             -DGGML_NATIVE=OFF `
             -DGGML_OPENMP=OFF
 
-          # The Clang executable itself is x64 and reports an x86_64 default target.
-          # What matters is that CMake passes the ARM64 target to every compilation.
           $commands = Get-Content "build-arm64\compile_commands.json" -Raw
           if ($commands -notmatch "arm64-pc-windows-msvc") {
             throw "Compile commands do not contain the ARM64 Clang target"
@@ -159,7 +146,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          cmake --build build-arm64 --parallel $env:NUMBER_OF_PROCESSORS
+          cmake --build build-arm64 --target sd-server --parallel $env:NUMBER_OF_PROCESSORS
 
       - name: Verify ARM64 binaries
         shell: pwsh
