@@ -146,7 +146,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          cmake --build build-arm64 --target sd-server --parallel $env:NUMBER_OF_PROCESSORS
+          cmake --build build-arm64 --target sd-server sd-cli --parallel $env:NUMBER_OF_PROCESSORS
 
       - name: Verify ARM64 binaries
         shell: pwsh
@@ -158,6 +158,9 @@ jobs:
 
           $server = Get-ChildItem -Path $bin -Recurse -Filter "sd-server.exe" | Select-Object -First 1
           if (-not $server) { throw "sd-server.exe was not produced" }
+
+          $cli = Get-ChildItem -Path $bin -Recurse -Filter "sd-cli.exe" | Select-Object -First 1
+          if (-not $cli) { throw "sd-cli.exe was not produced" }
 
           $sdDll = Get-ChildItem -Path $bin -Recurse -Filter "stable-diffusion.dll" | Select-Object -First 1
           if (-not $sdDll) { throw "stable-diffusion.dll was not produced" }
