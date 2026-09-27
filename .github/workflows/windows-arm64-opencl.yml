@@ -77,9 +77,12 @@ jobs:
           $ErrorActionPreference = "Stop"
           $deps = Join-Path $env:RUNNER_TEMP "opencl-deps"
           New-Item -ItemType Directory -Force -Path $deps | Out-Null
+          $toolchain = "${{ github.workspace }}\cmake\arm64-windows-llvm.cmake"
 
           git clone --depth 1 https://github.com/KhronosGroup/OpenCL-Headers.git "$deps\OpenCL-Headers"
           cmake -S "$deps\OpenCL-Headers" -B "$deps\OpenCL-Headers\build" -G Ninja `
+            -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
+            -DCMAKE_BUILD_TYPE=Release `
             -DBUILD_TESTING=OFF `
             -DOPENCL_HEADERS_BUILD_TESTING=OFF `
             -DOPENCL_HEADERS_BUILD_CXX_TESTS=OFF `
@@ -88,7 +91,7 @@ jobs:
 
           git clone --depth 1 https://github.com/KhronosGroup/OpenCL-ICD-Loader.git "$deps\OpenCL-ICD-Loader"
           cmake -S "$deps\OpenCL-ICD-Loader" -B "$deps\OpenCL-ICD-Loader\build" -G Ninja `
-            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}\cmake\arm64-windows-llvm.cmake" `
+            -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_PREFIX_PATH="$env:OPENCL_PREFIX" `
             -DCMAKE_INSTALL_PREFIX="$env:OPENCL_PREFIX"
