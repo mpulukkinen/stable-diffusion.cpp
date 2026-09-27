@@ -63,17 +63,35 @@ jobs:
           choco install llvm -y --no-progress
           "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Verify toolchain
+      - name: Verify cross-compile toolchain
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           clang --version
           clang++ --version
           cmake --version
           ninja --version
+
           Write-Host "Host architecture: $env:VSCMD_ARG_HOST_ARCH"
           Write-Host "Target architecture: $env:VSCMD_ARG_TGT_ARCH"
-          Get-Command rc.exe | Format-List Source
-          Get-Command link.exe | Format-List Source
+          if ($env:VSCMD_ARG_HOST_ARCH -ne "x64" -and $env:VSCMD_ARG_HOST_ARCH -ne "amd64") {
+            throw "Expected an x64/amd64 host toolchain, got '$env:VSCMD_ARG_HOST_ARCH'"
+          }
+          if ($env:VSCMD_ARG_TGT_ARCH -ne "arm64") {
+            throw "Expected ARM64 target toolchain, got '$env:VSCMD_ARG_TGT_ARCH'"
+          }
+
+          $rc = Get-Command rc.exe -ErrorAction Stop
+          $link = Get-Command link.exe -ErrorAction Stop
+          $dumpbin = Get-Command dumpbin.exe -ErrorAction Stop
+          Write-Host "rc.exe: $($rc.Source)"
+          Write-Host "link.exe: $($link.Source)"
+          Write-Host "dumpbin.exe: $($dumpbin.Source)"
+
+          # Host-side SDK tools must be executable on the x64 runner. This catches
+          # the previous mistake where ARM64 rc.exe was selected and CreateProcess failed.
+          & $rc.Source /? | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "rc.exe is not runnable on the x64 build host" }
 
       - name: Build ARM64 OpenCL headers and ICD loader
         shell: pwsh
@@ -101,6 +119,15 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="$env:OPENCL_PREFIX"
           cmake --build "$deps\OpenCL-ICD-Loader\build" --target install
 
+          $openclDll = Get-ChildItem -Path "$env:OPENCL_PREFIX" -Recurse -Filter "OpenCL.dll" | Select-Object -First 1
+          if (-not $openclDll) { throw "OpenCL.dll was not produced" }
+          $dumpbin = (Get-Command dumpbin.exe -ErrorAction Stop).Source
+          $headers = & $dumpbin /headers $openclDll.FullName | Out-String
+          $headers | Write-Host
+          if ($headers -notmatch "AA64|ARM64") {
+            throw "OpenCL.dll is not ARM64"
+          }
+
       - name: Configure stable-diffusion.cpp ARM64 OpenCL
         shell: pwsh
         run: |
@@ -109,12 +136,24 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}\cmake\arm64-windows-llvm.cmake" `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_PREFIX_PATH="$env:OPENCL_PREFIX" `
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
             -DSD_OPENCL=ON `
             -DSD_BUILD_SHARED_LIBS=ON `
             -DSD_BUILD_SHARED_GGML_LIB=ON `
             -DGGML_BACKEND_DL=ON `
             -DGGML_NATIVE=OFF `
             -DGGML_OPENMP=OFF
+
+          $cache = Get-Content "build-arm64\CMakeCache.txt" -Raw
+          if ($cache -notmatch "CMAKE_SYSTEM_PROCESSOR:UNINITIALIZED=arm64|CMAKE_SYSTEM_PROCESSOR:STRING=arm64") {
+            Write-Host $cache
+            throw "CMake did not configure for ARM64"
+          }
+
+          $commands = Get-Content "build-arm64\compile_commands.json" -Raw
+          if ($commands -notmatch "arm64-pc-windows-msvc") {
+            throw "Compile commands do not contain the ARM64 Clang target"
+          }
 
       - name: Build stable-diffusion.cpp ARM64 OpenCL
         shell: pwsh
@@ -130,14 +169,23 @@ jobs:
           if (-not (Test-Path $bin)) { throw "Build output directory not found: $bin" }
           Get-ChildItem -Path $bin -Recurse
 
+          $server = Get-ChildItem -Path $bin -Recurse -Filter "sd-server.exe" | Select-Object -First 1
+          if (-not $server) { throw "sd-server.exe was not produced" }
+
           $sdDll = Get-ChildItem -Path $bin -Recurse -Filter "stable-diffusion.dll" | Select-Object -First 1
           if (-not $sdDll) { throw "stable-diffusion.dll was not produced" }
 
-          $dumpbin = Get-Command dumpbin.exe -ErrorAction Stop
-          $headers = & $dumpbin.Source /headers $sdDll.FullName | Out-String
-          $headers | Write-Host
-          if ($headers -notmatch "AA64|ARM64") {
-            throw "stable-diffusion.dll does not appear to be ARM64"
+          $dumpbin = (Get-Command dumpbin.exe -ErrorAction Stop).Source
+          $nativeFiles = Get-ChildItem -Path $bin -Recurse -File | Where-Object { $_.Extension -in @('.exe', '.dll') }
+          if (-not $nativeFiles) { throw "No native binaries were produced" }
+
+          foreach ($file in $nativeFiles) {
+            $headers = & $dumpbin /headers $file.FullName | Out-String
+            if ($headers -notmatch "AA64|ARM64") {
+              Write-Host $headers
+              throw "$($file.FullName) is not ARM64"
+            }
+            Write-Host "ARM64 OK: $($file.Name)"
           }
 
       - name: Package ARM64 release
