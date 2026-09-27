@@ -1,0 +1,181 @@
+name: Windows ARM64 OpenCL
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish/update a GitHub Release with the ARM64 package
+        required: true
+        default: false
+        type: boolean
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/windows-arm64-opencl.yml"
+      - "cmake/arm64-windows-llvm.cmake"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "src/**"
+      - "examples/**"
+      - "ggml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-arm64-opencl-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows ARM64 OpenCL
+    runs-on: windows-2022
+
+    env:
+      OPENCL_PREFIX: ${{ github.workspace }}\opencl-arm64
+      PACKAGE_NAME: stable-diffusion-win-arm64-opencl.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+
+      - name: Activate ARM64 Visual Studio environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      - name: Install LLVM
+        shell: pwsh
+        run: |
+          choco install llvm -y --no-progress
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Verify toolchain
+        shell: pwsh
+        run: |
+          clang --version
+          clang++ --version
+          cmake --version
+          ninja --version
+
+      - name: Build ARM64 OpenCL headers and ICD loader
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $deps = Join-Path $env:RUNNER_TEMP "opencl-deps"
+          New-Item -ItemType Directory -Force -Path $deps | Out-Null
+
+          git clone --depth 1 https://github.com/KhronosGroup/OpenCL-Headers.git "$deps\OpenCL-Headers"
+          cmake -S "$deps\OpenCL-Headers" -B "$deps\OpenCL-Headers\build" -G Ninja `
+            -DBUILD_TESTING=OFF `
+            -DOPENCL_HEADERS_BUILD_TESTING=OFF `
+            -DOPENCL_HEADERS_BUILD_CXX_TESTS=OFF `
+            -DCMAKE_INSTALL_PREFIX="$env:OPENCL_PREFIX"
+          cmake --build "$deps\OpenCL-Headers\build" --target install
+
+          git clone --depth 1 https://github.com/KhronosGroup/OpenCL-ICD-Loader.git "$deps\OpenCL-ICD-Loader"
+          cmake -S "$deps\OpenCL-ICD-Loader" -B "$deps\OpenCL-ICD-Loader\build" -G Ninja `
+            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}\cmake\arm64-windows-llvm.cmake" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_PREFIX_PATH="$env:OPENCL_PREFIX" `
+            -DCMAKE_INSTALL_PREFIX="$env:OPENCL_PREFIX"
+          cmake --build "$deps\OpenCL-ICD-Loader\build" --target install
+
+      - name: Configure stable-diffusion.cpp ARM64 OpenCL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cmake -S . -B build-arm64 -G Ninja `
+            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}\cmake\arm64-windows-llvm.cmake" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_PREFIX_PATH="$env:OPENCL_PREFIX" `
+            -DSD_OPENCL=ON `
+            -DSD_BUILD_SHARED_LIBS=ON `
+            -DSD_BUILD_SHARED_GGML_LIB=ON `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_OPENMP=OFF
+
+      - name: Build stable-diffusion.cpp ARM64 OpenCL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cmake --build build-arm64 --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: Verify ARM64 binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bin = Join-Path "${{ github.workspace }}" "build-arm64\bin"
+          if (-not (Test-Path $bin)) { throw "Build output directory not found: $bin" }
+          Get-ChildItem -Path $bin -Recurse
+
+          $sdDll = Get-ChildItem -Path $bin -Recurse -Filter "stable-diffusion.dll" | Select-Object -First 1
+          if (-not $sdDll) { throw "stable-diffusion.dll was not produced" }
+
+          $dumpbin = Get-Command dumpbin.exe -ErrorAction Stop
+          $headers = & $dumpbin.Source /headers $sdDll.FullName | Out-String
+          $headers | Write-Host
+          if ($headers -notmatch "AA64|ARM64") {
+            throw "stable-diffusion.dll does not appear to be ARM64"
+          }
+
+      - name: Package ARM64 release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = Join-Path "${{ github.workspace }}" "package-arm64"
+          Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          Copy-Item "build-arm64\bin\*" $stage -Recurse -Force
+
+          $openclDll = Get-ChildItem -Path "$env:OPENCL_PREFIX" -Recurse -Filter "OpenCL.dll" | Select-Object -First 1
+          if ($openclDll) {
+            Copy-Item $openclDll.FullName (Join-Path $stage "OpenCL.dll") -Force
+          } else {
+            throw "ARM64 OpenCL ICD loader (OpenCL.dll) was not found"
+          }
+
+          Copy-Item "LICENSE" (Join-Path $stage "stable-diffusion.cpp.txt") -Force
+          Copy-Item "ggml\LICENSE" (Join-Path $stage "ggml.txt") -Force
+
+          $zip = Join-Path "${{ github.workspace }}" $env:PACKAGE_NAME
+          Remove-Item $zip -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip -CompressionLevel Optimal
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-diffusion-win-arm64-opencl
+          path: ${{ env.PACKAGE_NAME }}
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $short = "${{ github.sha }}".Substring(0, 7)
+          $tag = "arm64-opencl-$short"
+          gh release create $tag $env:PACKAGE_NAME `
+            --repo "${{ github.repository }}" `
+            --target "${{ github.sha }}" `
+            --title "Windows ARM64 OpenCL $short" `
+            --notes "Windows ARM64 build of stable-diffusion.cpp with the Qualcomm Adreno OpenCL backend enabled." `
+            --latest
