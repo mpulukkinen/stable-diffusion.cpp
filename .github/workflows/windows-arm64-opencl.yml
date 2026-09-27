@@ -52,10 +52,10 @@ jobs:
         with:
           version: 10.15.1
 
-      - name: Activate ARM64 Visual Studio environment
+      - name: Activate ARM64 cross-compile Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: arm64
+          arch: amd64_arm64
 
       - name: Install LLVM
         shell: pwsh
@@ -70,6 +70,10 @@ jobs:
           clang++ --version
           cmake --version
           ninja --version
+          Write-Host "Host architecture: $env:VSCMD_ARG_HOST_ARCH"
+          Write-Host "Target architecture: $env:VSCMD_ARG_TGT_ARCH"
+          Get-Command rc.exe | Format-List Source
+          Get-Command link.exe | Format-List Source
 
       - name: Build ARM64 OpenCL headers and ICD loader
         shell: pwsh
