@@ -124,7 +124,7 @@ jobs:
             "-DGGML_OPENMP=OFF", "-DGGML_CPU_ALL_VARIANTS=OFF",
             "-DGGML_CPU_ARM_ARCH=armv8-a",
             "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
-            "-DCMAKE_CXX_FLAGS=/bigobj /EHsc"
+            "-DCMAKE_CXX_FLAGS=-fexceptions"
           )
           & cmake @cmakeArgs
           if ($LASTEXITCODE -ne 0) { throw "CUDA CMake configuration failed ($LASTEXITCODE)" }
