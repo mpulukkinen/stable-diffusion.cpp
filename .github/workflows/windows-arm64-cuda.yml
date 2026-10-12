@@ -1,0 +1,220 @@
+name: Windows ARM64 CUDA
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        type: boolean
+        required: true
+        default: false
+  push:
+    branches:
+      - master
+      - ci/windows-arm64-cuda
+    paths:
+      - ".github/workflows/windows-arm64-cuda.yml"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - "src/**"
+      - "examples/**"
+      - "ggml"
+  pull_request:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/windows-arm64-cuda.yml"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - "src/**"
+      - "examples/**"
+      - "ggml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-arm64-cuda-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PACKAGE_NAME: stable-diffusion-win-arm64-cuda.zip
+
+jobs:
+  build:
+    name: Build and verify Windows ARM64 CUDA
+    runs-on: windows-2022
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup ARM64 MSVC cross-compile environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64_arm64
+
+      - name: Install CUDA 13.4 compiler and ARM64 libraries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+          if ($env:VSCMD_ARG_TGT_ARCH -ne "arm64") { throw "ARM64 toolchain not active" }
+          $root = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
+          $urlRoot = "https://developer.download.nvidia.com/compute/cuda/redist"
+          $redists = @(
+            @("cccl", "windows-x86_64", "13.3.4.2.1"),
+            @("cuda_crt", "windows-x86_64", "13.4.59"),
+            @("cuda_nvcc", "windows-x86_64", "13.4.59"),
+            @("libnvvm", "windows-x86_64", "13.4.59"),
+            @("cuda_cudart", "windows-arm64", "13.4.49"),
+            @("libcublas", "windows-arm64", "13.7.0.27")
+          )
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $cache = Join-Path $env:RUNNER_TEMP "cuda-components"
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          foreach ($pkg in $redists) {
+            $pkgName, $arch, $version = $pkg
+            $name = "$pkgName-$arch-$version-archive"
+            $zip = Join-Path $cache "$name.zip"
+            $url = "$urlRoot/$pkgName/$arch/$name.zip"
+            & curl.exe --fail --location --retry 4 --retry-delay 3 --output $zip $url
+            if ($LASTEXITCODE -ne 0) { throw "Download failed: $url" }
+            $extract = Join-Path $cache $name
+            Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+            $src = Join-Path $extract $name
+            if (-not (Test-Path $src)) { throw "Unexpected NVIDIA redist layout: $name" }
+            Copy-Item -Path "$src\*" -Destination $root -Recurse -Force
+            Remove-Item -LiteralPath $extract -Recurse -Force
+            Remove-Item -LiteralPath $zip -Force
+          }
+          foreach ($required in @(
+            "$root\bin\nvcc.exe",
+            "$root\include\cuda_runtime.h",
+            "$root\lib\arm64\cudart.lib",
+            "$root\lib\arm64\cublas.lib",
+            "$root\lib\arm64\cublasLt.lib",
+            "$root\lib\arm64\cuda.lib"
+          )) {
+            if (-not (Test-Path $required)) { throw "Missing ARM64 CUDA component: $required" }
+          }
+          "CUDA_PATH=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$root\bin\nvcc.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "nvcc failed" }
+
+      - name: Configure stable-diffusion.cpp for ARM64 CUDA
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cmakeArgs = @(
+            "-S", ".", "-B", "build-arm64-cuda", "-G", "Ninja Multi-Config",
+            "-DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm-cuda.cmake",
+            "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+            "-DCMAKE_CUDA_ARCHITECTURES=121a-real",
+            "-DSD_CUDA=ON", "-DGGML_CUDA=ON",
+            "-DSD_VULKAN=OFF", "-DSD_OPENCL=OFF",
+            "-DSD_WEBP=OFF", "-DSD_WEBM=OFF",
+            "-DSD_SERVER_BUILD_FRONTEND=OFF",
+            "-DSD_BUILD_SHARED_LIBS=ON", "-DSD_BUILD_SHARED_GGML_LIB=ON",
+            "-DGGML_BACKEND_DL=ON", "-DGGML_NATIVE=OFF",
+            "-DGGML_OPENMP=OFF", "-DGGML_CPU_ALL_VARIANTS=OFF",
+            "-DGGML_CPU_ARM_ARCH=armv8-a",
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
+            "-DCMAKE_CXX_FLAGS=-fexceptions"
+          )
+          & cmake @cmakeArgs
+          if ($LASTEXITCODE -ne 0) { throw "CUDA CMake configuration failed ($LASTEXITCODE)" }
+          $cache = Get-Content build-arm64-cuda\CMakeCache.txt
+          foreach ($flag in @("SD_CUDA", "GGML_CUDA", "GGML_BACKEND_DL")) {
+            $match = $cache | Where-Object { $_ -match "^$([regex]::Escape($flag)):(BOOL|UNINITIALIZED)=(ON|TRUE|YES|1)$" }
+            if (-not $match) { throw "Required CUDA CMake option $flag was not enabled" }
+          }
+
+      - name: Build ARM64 CUDA server and CLI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cmake --build build-arm64-cuda --config Release --target sd-server sd-cli --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw "ARM64 CUDA compilation failed ($LASTEXITCODE)" }
+
+      - name: Copy ARM64 CUDA redistributable DLLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bin = "build-arm64-cuda\bin\Release"
+          $cudaBin = Join-Path $env:CUDA_PATH "bin\arm64"
+          foreach ($pattern in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")) {
+            $files = @(Get-ChildItem -LiteralPath $cudaBin -Filter $pattern -File)
+            if ($files.Count -eq 0) { throw "Missing ARM64 CUDA runtime: $pattern" }
+            foreach ($file in $files) { Copy-Item -LiteralPath $file.FullName -Destination $bin -Force }
+          }
+
+      - name: Verify all binaries target ARM64 and include CUDA
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bin = "build-arm64-cuda\bin\Release"
+          foreach ($name in @("sd-server.exe", "sd-cli.exe", "stable-diffusion.dll", "ggml-cuda.dll")) {
+            if (-not (Test-Path (Join-Path $bin $name))) { throw "Required CUDA binary missing: $name" }
+          }
+          $files = @(Get-ChildItem -LiteralPath $bin -File | Where-Object { $_.Extension -in @(".exe", ".dll") })
+          foreach ($file in $files) {
+            $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+            $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+            if ($machine -ne 0xAA64) { throw "$($file.Name) is not ARM64 PE ($machine)" }
+            Write-Host "ARM64: $($file.Name)"
+          }
+          # Verify real CUDA .cu object files were produced, rather than guessing
+          # a DLL's dependencies by scanning raw binary bytes as ASCII strings.
+          $cudaObjDir = "build-arm64-cuda\\ggml\\src\\ggml-cuda\\CMakeFiles\\ggml-cuda.dir\\Release"
+          $cudaObjects = @(Get-ChildItem -LiteralPath $cudaObjDir -Recurse -File -Filter "*.cu.obj")
+          if ($cudaObjects.Count -eq 0) { throw "No compiled CUDA kernel objects were produced" }
+          Write-Host "Compiled CUDA kernel objects: $($cudaObjects.Count)"
+          $deps = & dumpbin.exe /dependents (Join-Path $bin "ggml-cuda.dll") | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin could not inspect ggml-cuda.dll" }
+          Write-Host "ggml-cuda.dll dependencies: "
+          Write-Host $deps
+
+      - name: Package ARM64 CUDA distribution
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = Join-Path $env:RUNNER_TEMP "stable-diffusion-arm64-cuda"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Path "build-arm64-cuda\bin\Release\*" -Destination $stage -Recurse -Force
+          Copy-Item LICENSE (Join-Path $stage "stable-diffusion.cpp.txt") -Force
+          Copy-Item ggml\LICENSE (Join-Path $stage "ggml.txt") -Force
+          Compress-Archive -Path "$stage\*" -DestinationPath $env:PACKAGE_NAME -Force
+
+      - name: Upload ARM64 CUDA build ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-diffusion-win-arm64-cuda
+          path: ${{ env.PACKAGE_NAME }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish Windows ARM64 CUDA release
+        if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/master') || (github.event_name == 'workflow_dispatch' && inputs.publish_release) }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+          $tag = "arm64-cuda-$short"
+          $releaseArgs = @(
+            "release", "create", $tag, $env:PACKAGE_NAME,
+            "--repo", $env:GITHUB_REPOSITORY,
+            "--target", $env:GITHUB_SHA,
+            "--title", "Windows ARM64 CUDA $short",
+            "--notes", "Native Windows ARM64 stable-diffusion.cpp build with CUDA 13.4 and sm_121a Blackwell kernels for RTX Spark. Includes sd-cli, sd-server, ggml-cuda and ARM64 CUDA runtime DLLs. GPU inference still requires device validation.",
+            "--latest=false"
+          )
+          & gh @releaseArgs
+          if ($LASTEXITCODE -ne 0) { throw "GitHub Release failed ($LASTEXITCODE)" }
