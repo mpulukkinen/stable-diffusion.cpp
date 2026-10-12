@@ -93,7 +93,7 @@ jobs:
             "-DGGML_CPU_ALL_VARIANTS=OFF",
             "-DGGML_CPU_ARM_ARCH=armv8-a",
             "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
-            "-DCMAKE_CXX_FLAGS=/bigobj",
+            "-DCMAKE_CXX_FLAGS=/bigobj /EHsc",
             "-DVulkan_LIBRARY=$env:VULKAN_SDK\Lib-ARM64\vulkan-1.lib",
             "-DVulkan_INCLUDE_DIR=$env:VULKAN_SDK\Include",
             "-DVulkan_GLSLC_EXECUTABLE=$env:VULKAN_SDK\Bin\glslc.exe"
