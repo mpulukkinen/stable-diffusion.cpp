@@ -1,4 +1,5 @@
 name: Windows ARM64 Vulkan
+# CI trigger probe: no functional changes; verify Actions detects this PR push.
 
 on:
   workflow_dispatch:
