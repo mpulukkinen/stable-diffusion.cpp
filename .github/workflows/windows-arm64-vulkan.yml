@@ -108,7 +108,10 @@ jobs:
               throw "Expected $flag=ON in Vulkan CMakeCache.txt (found: $actual)"
             }
           }
-          $vulkanLib = $cache | Where-Object { $_ -match '^Vulkan_LIBRARY:(FILEPATH|UNINITIALIZED)=.*Lib-ARM64.*vulkan-1\.lib
+          $vulkanLib = $cache | Where-Object { $_ -match '^Vulkan_LIBRARY:(FILEPATH|UNINITIALIZED)=.*Lib-ARM64.*vulkan-1\.lib$' }
+          if (-not $vulkanLib) {
+            throw "Vulkan library is not the ARM64 SDK import library"
+          }
 
       - name: Build ARM64 Vulkan server and CLI
         shell: pwsh
