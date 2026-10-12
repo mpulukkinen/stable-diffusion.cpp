@@ -134,6 +134,7 @@ namespace sd::backend_fit {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             const auto type        = ggml_backend_dev_type(dev);
             if (type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+                type != GGML_BACKEND_DEVICE_TYPE_IGPU &&
                 (!include_other_devices || type == GGML_BACKEND_DEVICE_TYPE_CPU)) {
                 continue;
             }

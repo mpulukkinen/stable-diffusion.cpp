@@ -56,6 +56,11 @@ private:
         bool staged_to_compute_backend = false;
         uint64_t applied_lora_epoch    = UINT64_MAX;
         uint64_t last_use_epoch        = 0;
+
+        mutable ggml_backend_t support_backend                   = nullptr;
+        mutable ggml_backend_buffer_type_t support_buffer_type   = nullptr;
+        mutable bool support_cached                               = false;
+        mutable bool compute_backend_supported                    = false;
     };
 
     struct ParamsStorageBlock {
@@ -144,6 +149,7 @@ private:
                               std::vector<ParamsStorageBlock*>& created_storage_blocks);
     bool load_tensors(const std::vector<TensorState*>& states);
     bool stage_tensors_to_compute_backend(const std::vector<TensorState*>& states);
+    bool compute_backend_supports_param(const TensorState& state) const;
     size_t compute_backend_alloc_size(const std::vector<TensorState*>& states,
                                       bool missing_only) const;
     size_t compute_backend_resident_bytes(ggml_backend_t compute_backend) const;

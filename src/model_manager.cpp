@@ -59,15 +59,16 @@ static bool device_supports_param_op(ggml_backend_dev_t device,
                                      ggml_tensor* weight,
                                      enum ggml_op op,
                                      ggml_backend_buffer_type_t buft) {
-    if (op == GGML_OP_NONE) {
-        return true;
+    if (device == nullptr || weight == nullptr || buft == nullptr) {
+        return false;
     }
-    if (device == nullptr || weight == nullptr || buft == nullptr || weight->buffer != nullptr) {
+
+    if (!ggml_backend_dev_supports_buft(device, buft)) {
         return false;
     }
 
     ggml_init_params params;
-    params.mem_size   = ggml_tensor_overhead() * 2;
+    params.mem_size   = ggml_tensor_overhead() * 4;
     params.mem_buffer = nullptr;
     params.no_alloc   = true;
     ggml_context* ctx = ggml_init(params);
@@ -75,28 +76,38 @@ static bool device_supports_param_op(ggml_backend_dev_t device,
         return false;
     }
 
+    ggml_tensor* test_weight      = ggml_dup_tensor(ctx, weight);
+    ggml_backend_buffer_t buffer  = ggml_backend_buft_alloc_buffer(buft, 0);
+    if (test_weight == nullptr || buffer == nullptr) {
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        return false;
+    }
+    test_weight->buffer = buffer;
+    bool supported      = ggml_backend_dev_supports_op(device, test_weight);
+    if (!supported || op == GGML_OP_NONE) {
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        return supported;
+    }
+
     ggml_tensor* op_tensor = nullptr;
     if (op == GGML_OP_GET_ROWS) {
         ggml_tensor* indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-        op_tensor            = ggml_get_rows(ctx, weight, indices);
+        op_tensor            = ggml_get_rows(ctx, test_weight, indices);
     } else if (op == GGML_OP_CUSTOM) {
         op_tensor         = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
         op_tensor->op     = op;
-        op_tensor->src[0] = weight;
+        op_tensor->src[0] = test_weight;
     }
     if (op_tensor == nullptr) {
+        ggml_backend_buffer_free(buffer);
         ggml_free(ctx);
         return false;
     }
 
-    weight->buffer = ggml_backend_buft_alloc_buffer(buft, 0);
-    if (weight->buffer == nullptr) {
-        ggml_free(ctx);
-        return false;
-    }
-    bool supported = ggml_backend_dev_supports_op(device, op_tensor);
-    ggml_backend_buffer_free(weight->buffer);
-    weight->buffer = nullptr;
+    supported = ggml_backend_dev_supports_op(device, op_tensor);
+    ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
     return supported;
 }
@@ -497,6 +508,30 @@ bool ModelManager::load_tensors_to_params_backend(const std::vector<TensorState*
     return true;
 }
 
+bool ModelManager::compute_backend_supports_param(const TensorState& state) const {
+    if (state.tensor == nullptr || state.compute_backend == nullptr) {
+        return false;
+    }
+    ggml_backend_dev_t device = ggml_backend_get_device(state.compute_backend);
+    if (device == nullptr) {
+        return false;
+    }
+    ggml_backend_buffer_type_t buft = split_buffer_type_for(state);
+    if (buft == nullptr) {
+        buft = ggml_backend_get_default_buffer_type(state.compute_backend);
+    }
+    if (state.support_cached &&
+        state.support_backend == state.compute_backend &&
+        state.support_buffer_type == buft) {
+        return state.compute_backend_supported;
+    }
+    state.support_backend           = state.compute_backend;
+    state.support_buffer_type       = buft;
+    state.compute_backend_supported = device_supports_param_op(device, state.tensor, state.usage_op, buft);
+    state.support_cached            = true;
+    return state.compute_backend_supported;
+}
+
 bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorState*>& states) {
     std::map<std::pair<ggml_backend_t, ggml_backend_buffer_type_t>, std::vector<TensorState*>> states_by_staging_target;
     for (TensorState* state : states) {
@@ -511,9 +546,11 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
             LOG_ERROR("model manager params backend is null for tensor '%s'", state->name.c_str());
             return false;
         }
-        // Custom CPU operators must retain host weights even when the runner uses a GPU.
+        // Custom CPU operators and tensors outside the compute device's addressing limits
+        // must retain host weights even when the runner uses a GPU.
         if (state->usage_op == GGML_OP_CUSTOM ||
-            state->compute_backend == state->params_backend || state->staged_to_compute_backend) {
+            state->compute_backend == state->params_backend || state->staged_to_compute_backend ||
+            !compute_backend_supports_param(*state)) {
             continue;
         }
         if (!state->loaded_to_params_backend || state->tensor == nullptr || state->tensor->data == nullptr) {
@@ -1097,8 +1134,7 @@ ggml_backend_buffer_type_t ModelManager::params_buffer_type_for(const TensorStat
     if (params_buft == nullptr) {
         params_buft = ggml_backend_get_default_buffer_type(state.params_backend);
     }
-    if (state.usage_op != GGML_OP_NONE &&
-        state.compute_backend != nullptr) {
+    if (state.compute_backend != nullptr) {
         ggml_backend_dev_t compute_dev = ggml_backend_get_device(state.compute_backend);
         if (device_supports_param_op(compute_dev, state.tensor, state.usage_op, params_buft)) {
             return params_buft;
@@ -1408,7 +1444,8 @@ size_t ModelManager::compute_backend_alloc_size(const std::vector<TensorState*>&
         if (state == nullptr || state->tensor == nullptr) {
             continue;
         }
-        if (state->usage_op == GGML_OP_CUSTOM && !sd_backend_is_cpu(state->compute_backend)) {
+        if ((state->usage_op == GGML_OP_CUSTOM && !sd_backend_is_cpu(state->compute_backend)) ||
+            !compute_backend_supports_param(*state)) {
             continue;
         }
         const bool compute_resident =

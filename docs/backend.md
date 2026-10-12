@@ -135,7 +135,8 @@ regardless of argument order, even with `--auto-fit on`.
 
 Auto-fit preserves explicit `--backend` assignments, including per-module
 assignments and device lists. For modules without a runtime assignment, it chooses
-the GPU with the largest available memory budget (the first device on a tie).
+the discrete or integrated GPU with the largest available memory budget (the first
+device on a tie).
 It then derives parameter placements from the model metadata, each module's
 compute devices, and the remaining memory budgets. The chosen backend
 specifications are printed.
@@ -182,6 +183,10 @@ use offloaded parameters. Their GPU copies can then be released after their
 phases, leaving more room to reuse diffusion weights across sampling steps.
 CPU parameter residency allows GPU weight caching; it does not force every
 weight to be copied again at every step.
+
+If an individual weight exceeds a compute device's tensor addressing limits, it
+remains in a compatible CPU buffer and the backend scheduler runs that operation
+on CPU. Other compatible weights and operations continue to use the selected GPU.
 
 RAM and GPU budgets are shared across components. Each component uses a single
 parameter backend; several other GPUs' capacities are not combined to store
