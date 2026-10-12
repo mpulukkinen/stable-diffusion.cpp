@@ -79,6 +79,7 @@ jobs:
             "-S", ".", "-B", "build-arm64-vulkan",
             "-G", "Visual Studio 17 2022", "-A", "ARM64", "-T", "ClangCL",
             "-DSD_VULKAN=ON",
+            "-DGGML_VULKAN=ON",
             "-DSD_OPENCL=OFF",
             "-DSD_WEBP=OFF",
             "-DSD_WEBM=OFF",
