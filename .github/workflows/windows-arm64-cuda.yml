@@ -169,10 +169,16 @@ jobs:
             if ($machine -ne 0xAA64) { throw "$($file.Name) is not ARM64 PE ($machine)" }
             Write-Host "ARM64: $($file.Name)"
           }
-          $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes((Join-Path $bin "ggml-cuda.dll")))
-          if ($text.IndexOf("cudart64_", [StringComparison]::OrdinalIgnoreCase) -lt 0) {
-            throw "ggml-cuda.dll has no CUDA runtime dependency"
-          }
+          # Verify real CUDA .cu object files were produced, rather than guessing
+          # a DLL's dependencies by scanning raw binary bytes as ASCII strings.
+          $cudaObjDir = "build-arm64-cuda\\ggml\\src\\ggml-cuda\\CMakeFiles\\ggml-cuda.dir\\Release"
+          $cudaObjects = @(Get-ChildItem -LiteralPath $cudaObjDir -Recurse -File -Filter "*.cu.obj")
+          if ($cudaObjects.Count -eq 0) { throw "No compiled CUDA kernel objects were produced" }
+          Write-Host "Compiled CUDA kernel objects: $($cudaObjects.Count)"
+          $deps = & dumpbin.exe /dependents (Join-Path $bin "ggml-cuda.dll") | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin could not inspect ggml-cuda.dll" }
+          Write-Host "ggml-cuda.dll dependencies: "
+          Write-Host $deps
 
       - name: Package ARM64 CUDA distribution
         shell: pwsh
