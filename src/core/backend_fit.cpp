@@ -127,6 +127,15 @@ namespace sd::backend_fit {
         return name;
     }
 
+    static bool needs_adreno_cpu_compute(const Device& device, ComponentKind kind) {
+        if (kind == ComponentKind::DIT) {
+            return false;
+        }
+        const std::string name        = budget_key(device.name);
+        const std::string description = budget_key(device.description);
+        return name.rfind("vulkan", 0) == 0 && description.find("adreno") != std::string::npos;
+    }
+
     static std::vector<Device> enumerate_gpu_devices(const sd::ggml_graph_cut::MaxVramAssignment& budgets,
                                                      bool include_other_devices) {
         std::vector<Device> out;
@@ -215,7 +224,14 @@ namespace sd::backend_fit {
             if (plan.main_device == SIZE_MAX) {
                 return plan;
             }
-            plan.runtimes.resize(components.size(), {devices[plan.main_device].name, {plan.main_device}});
+            plan.runtimes.reserve(components.size());
+            for (const Component& component : components) {
+                if (needs_adreno_cpu_compute(devices[plan.main_device], component.kind)) {
+                    plan.runtimes.push_back({"cpu", {}});
+                } else {
+                    plan.runtimes.push_back({devices[plan.main_device].name, {plan.main_device}});
+                }
+            }
         }
 
         std::vector<size_t> order(components.size());
@@ -448,6 +464,11 @@ namespace sd::backend_fit {
                 runtime_spec = "cpu";
             }
             return true;
+        }
+
+        if (runtimes.empty() && plan.main_device != SIZE_MAX &&
+            needs_adreno_cpu_compute(devices[plan.main_device], ComponentKind::CONDITIONER)) {
+            LOG_WARN("auto-fit: Qualcomm Adreno Vulkan uses CPU for text encoding and VAE compatibility");
         }
 
         print_plan(plan, components, devices, free_ram, ram_budget);

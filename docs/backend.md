@@ -141,6 +141,11 @@ It then derives parameter placements from the model metadata, each module's
 compute devices, and the remaining memory budgets. The chosen backend
 specifications are printed.
 
+On Qualcomm Adreno Vulkan devices, automatic placement keeps diffusion compute on
+Vulkan but runs the text encoder and VAE on CPU. This avoids known invalid text
+encoder output and VAE shader failures on the current driver. An explicit
+`--backend` assignment can override this compatibility placement.
+
 ```shell
 sd-cli -m model.safetensors -p "a cat" --auto-fit on
 sd-cli -m model.safetensors -p "a cat" --auto-fit on --max-vram cuda0=8,cuda1=14
