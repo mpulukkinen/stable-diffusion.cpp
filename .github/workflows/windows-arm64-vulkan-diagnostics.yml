@@ -74,7 +74,7 @@ jobs:
             "-DSD_WEBM=OFF",
             "-DSD_BUILD_SHARED_LIBS=ON",
             "-DSD_BUILD_SHARED_GGML_LIB=ON",
-            "-DGGML_BACKEND_DL=ON",
+            "-DGGML_BACKEND_DL=OFF",
             "-DGGML_NATIVE=OFF",
             "-DGGML_OPENMP=OFF",
             "-DGGML_CPU_ALL_VARIANTS=OFF",
@@ -100,7 +100,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $bin = Join-Path $env:GITHUB_WORKSPACE "build-arm64-vulkan-check\bin\Release"
-          foreach ($name in @("sd-cli.exe", "stable-diffusion.dll", "ggml-vulkan.dll")) {
+          foreach ($name in @("sd-cli.exe", "stable-diffusion.dll")) {
             if (-not (Test-Path (Join-Path $bin $name))) { throw "Missing diagnostic binary: $name" }
           }
           $stage = Join-Path $env:RUNNER_TEMP "stable-diffusion-arm64-vulkan-check"
