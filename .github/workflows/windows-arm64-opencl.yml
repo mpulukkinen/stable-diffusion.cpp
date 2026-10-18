@@ -135,6 +135,7 @@ jobs:
             -DSD_BUILD_SHARED_GGML_LIB=ON `
             -DGGML_BACKEND_DL=ON `
             -DGGML_NATIVE=OFF `
+            -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF `
             -DGGML_OPENMP=OFF
 
           $commands = Get-Content "build-arm64\compile_commands.json" -Raw
