@@ -210,8 +210,7 @@ WeightPrefetchResult ModelManager::prefetch_params(
             is_optional_missing_tensor(state->name)) {
             continue;
         }
-        if (state->usage_op == GGML_OP_CUSTOM || state->compute_backend == state->params_backend ||
-            !compute_backend_supports_param(*state)) {
+        if (state->usage_op == GGML_OP_CUSTOM || state->compute_backend == state->params_backend) {
             needs_synchronous_load = needs_synchronous_load ||
                                      !state->loaded_to_params_backend;
             continue;
@@ -278,7 +277,6 @@ bool ModelManager::activate_prefetched_params(
                    is_optional_missing_tensor(state->name) ||
                    state->usage_op == GGML_OP_CUSTOM ||
                    state->compute_backend == state->params_backend ||
-                   !compute_backend_supports_param(*state) ||
                    state->staged_to_compute_backend;
         });
     if (already_staged) {

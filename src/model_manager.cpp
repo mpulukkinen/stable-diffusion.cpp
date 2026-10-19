@@ -59,16 +59,15 @@ static bool device_supports_param_op(ggml_backend_dev_t device,
                                      ggml_tensor* weight,
                                      enum ggml_op op,
                                      ggml_backend_buffer_type_t buft) {
-    if (device == nullptr || weight == nullptr || buft == nullptr) {
-        return false;
+    if (op == GGML_OP_NONE) {
+        return true;
     }
-
-    if (!ggml_backend_dev_supports_buft(device, buft)) {
+    if (device == nullptr || weight == nullptr || buft == nullptr || weight->buffer != nullptr) {
         return false;
     }
 
     ggml_init_params params;
-    params.mem_size   = ggml_tensor_overhead() * 4;
+    params.mem_size   = ggml_tensor_overhead() * 2;
     params.mem_buffer = nullptr;
     params.no_alloc   = true;
     ggml_context* ctx = ggml_init(params);
@@ -76,38 +75,28 @@ static bool device_supports_param_op(ggml_backend_dev_t device,
         return false;
     }
 
-    ggml_tensor* test_weight      = ggml_dup_tensor(ctx, weight);
-    ggml_backend_buffer_t buffer  = ggml_backend_buft_alloc_buffer(buft, 0);
-    if (test_weight == nullptr || buffer == nullptr) {
-        ggml_backend_buffer_free(buffer);
-        ggml_free(ctx);
-        return false;
-    }
-    test_weight->buffer = buffer;
-    bool supported      = ggml_backend_dev_supports_op(device, test_weight);
-    if (!supported || op == GGML_OP_NONE) {
-        ggml_backend_buffer_free(buffer);
-        ggml_free(ctx);
-        return supported;
-    }
-
     ggml_tensor* op_tensor = nullptr;
     if (op == GGML_OP_GET_ROWS) {
         ggml_tensor* indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-        op_tensor            = ggml_get_rows(ctx, test_weight, indices);
+        op_tensor            = ggml_get_rows(ctx, weight, indices);
     } else if (op == GGML_OP_CUSTOM) {
         op_tensor         = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
         op_tensor->op     = op;
-        op_tensor->src[0] = test_weight;
+        op_tensor->src[0] = weight;
     }
     if (op_tensor == nullptr) {
-        ggml_backend_buffer_free(buffer);
         ggml_free(ctx);
         return false;
     }
 
-    supported = ggml_backend_dev_supports_op(device, op_tensor);
-    ggml_backend_buffer_free(buffer);
+    weight->buffer = ggml_backend_buft_alloc_buffer(buft, 0);
+    if (weight->buffer == nullptr) {
+        ggml_free(ctx);
+        return false;
+    }
+    bool supported = ggml_backend_dev_supports_op(device, op_tensor);
+    ggml_backend_buffer_free(weight->buffer);
+    weight->buffer = nullptr;
     ggml_free(ctx);
     return supported;
 }
@@ -508,30 +497,6 @@ bool ModelManager::load_tensors_to_params_backend(const std::vector<TensorState*
     return true;
 }
 
-bool ModelManager::compute_backend_supports_param(const TensorState& state) const {
-    if (state.tensor == nullptr || state.compute_backend == nullptr) {
-        return false;
-    }
-    ggml_backend_dev_t device = ggml_backend_get_device(state.compute_backend);
-    if (device == nullptr) {
-        return false;
-    }
-    ggml_backend_buffer_type_t buft = split_buffer_type_for(state);
-    if (buft == nullptr) {
-        buft = ggml_backend_get_default_buffer_type(state.compute_backend);
-    }
-    if (state.support_cached &&
-        state.support_backend == state.compute_backend &&
-        state.support_buffer_type == buft) {
-        return state.compute_backend_supported;
-    }
-    state.support_backend           = state.compute_backend;
-    state.support_buffer_type       = buft;
-    state.compute_backend_supported = device_supports_param_op(device, state.tensor, state.usage_op, buft);
-    state.support_cached            = true;
-    return state.compute_backend_supported;
-}
-
 bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorState*>& states) {
     std::map<std::pair<ggml_backend_t, ggml_backend_buffer_type_t>, std::vector<TensorState*>> states_by_staging_target;
     for (TensorState* state : states) {
@@ -546,11 +511,9 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
             LOG_ERROR("model manager params backend is null for tensor '%s'", state->name.c_str());
             return false;
         }
-        // Custom CPU operators and tensors outside the compute device's addressing limits
-        // must retain host weights even when the runner uses a GPU.
+        // Custom CPU operators must retain host weights even when the runner uses a GPU.
         if (state->usage_op == GGML_OP_CUSTOM ||
-            state->compute_backend == state->params_backend || state->staged_to_compute_backend ||
-            !compute_backend_supports_param(*state)) {
+            state->compute_backend == state->params_backend || state->staged_to_compute_backend) {
             continue;
         }
         if (!state->loaded_to_params_backend || state->tensor == nullptr || state->tensor->data == nullptr) {
@@ -1059,28 +1022,60 @@ bool ModelManager::load_tensor_parts(TensorState& state) {
 
 bool ModelManager::load_tensors(const std::vector<TensorState*>& states) {
     using ReadGroup = std::pair<ModelLoader::FileId, SDVersion>;
-    using ReadBatch = std::map<std::string, std::vector<TensorState*>>;
+    using ReadBatch = std::map<std::string, std::vector<ggml_tensor*>>;
     std::map<ReadGroup, std::vector<ReadBatch>> groups;
-    for (auto* state : states) {
-        if (state == nullptr)
-            continue;
-        if (state->sources.size() > 1) {
-            if (!load_tensor_parts(*state)) {
-                return false;
-            }
-            continue;
+    size_t part_count = 0;
+    for (const auto* state : states) {
+        if (state != nullptr && state->sources.size() > 1 && ggml_backend_buffer_is_host(state->tensor->buffer)) {
+            part_count += state->sources.size();
         }
-        auto& batches = groups[{state->source_file, state->source_version}];
-        // The loader supplies one destination per name; only conflicting types need another batch.
+    }
+    auto parts_ctx = std::unique_ptr<ggml_context, decltype(&ggml_free)>(
+        part_count > 0 ? ggml_init({part_count * ggml_tensor_overhead(), nullptr, true}) : nullptr, ggml_free);
+    if (part_count > 0 && !parts_ctx) {
+        return false;
+    }
+    auto add_destination = [&](const TensorState& state, const std::string& name, ggml_tensor* tensor) {
+        auto& batches = groups[{state.source_file, state.source_version}];
+        // The loader supplies one destination per name; incompatible destinations need another batch.
         auto batch = std::find_if(batches.begin(), batches.end(), [&](const ReadBatch& candidate) {
-            auto found = candidate.find(state->name);
-            return found == candidate.end() || found->second.front()->tensor->type == state->tensor->type;
+            auto found = candidate.find(name);
+            return found == candidate.end() ||
+                   (found->second.front()->type == tensor->type && ggml_are_same_shape(found->second.front(), tensor));
         });
         if (batch == batches.end()) {
             batches.emplace_back();
             batch = std::prev(batches.end());
         }
-        (*batch)[state->name].push_back(state);
+        (*batch)[name].push_back(tensor);
+    };
+    for (auto* state : states) {
+        if (state == nullptr)
+            continue;
+        if (state->sources.size() > 1) {
+            if (ggml_backend_buffer_is_host(state->tensor->buffer)) {
+                const size_t size = ggml_nbytes(state->tensor);
+                size_t offset     = 0;
+                for (const auto& source : state->sources) {
+                    auto* part             = ggml_new_tensor(parts_ctx.get(), state->tensor->type, source.n_dims, source.ne);
+                    const size_t part_size = ggml_nbytes(part);
+                    if (part_size > size - offset) {
+                        return false;
+                    }
+                    part->data   = static_cast<uint8_t*>(state->tensor->data) + offset;
+                    part->buffer = state->tensor->buffer;
+                    add_destination(*state, source.name, part);
+                    offset += part_size;
+                }
+                if (offset != size) {
+                    return false;
+                }
+            } else if (!load_tensor_parts(*state)) {
+                return false;
+            }
+            continue;
+        }
+        add_destination(*state, state->name, state->tensor);
     }
     for (auto& group : groups) {
         for (auto& batch : group.second) {
@@ -1094,7 +1089,7 @@ bool ModelManager::load_tensors(const std::vector<TensorState*>& states) {
                 auto found = batch.find(source.name);
                 if (found == batch.end())
                     return true;
-                *dst = found->second.front()->tensor;
+                *dst = found->second.front();
                 std::lock_guard<std::mutex> lock(mutex);
                 loaded.insert(source.name);
                 return true;
@@ -1105,14 +1100,17 @@ bool ModelManager::load_tensors(const std::vector<TensorState*>& states) {
             if (!success || loaded != names)
                 return false;
             for (auto& entry : batch) {
-                auto* first = entry.second.front()->tensor;
-                for (auto* state : entry.second) {
-                    if (state->tensor != first)
-                        ggml_backend_tensor_copy(first, state->tensor);
-                    state->loaded_to_params_backend = true;
+                auto* first = entry.second.front();
+                for (auto* tensor : entry.second) {
+                    if (tensor != first)
+                        ggml_backend_tensor_copy(first, tensor);
                 }
             }
         }
+    }
+    for (auto* state : states) {
+        if (state != nullptr)
+            state->loaded_to_params_backend = true;
     }
     return true;
 }
@@ -1134,7 +1132,8 @@ ggml_backend_buffer_type_t ModelManager::params_buffer_type_for(const TensorStat
     if (params_buft == nullptr) {
         params_buft = ggml_backend_get_default_buffer_type(state.params_backend);
     }
-    if (state.compute_backend != nullptr) {
+    if (state.usage_op != GGML_OP_NONE &&
+        state.compute_backend != nullptr) {
         ggml_backend_dev_t compute_dev = ggml_backend_get_device(state.compute_backend);
         if (device_supports_param_op(compute_dev, state.tensor, state.usage_op, params_buft)) {
             return params_buft;
@@ -1444,8 +1443,7 @@ size_t ModelManager::compute_backend_alloc_size(const std::vector<TensorState*>&
         if (state == nullptr || state->tensor == nullptr) {
             continue;
         }
-        if ((state->usage_op == GGML_OP_CUSTOM && !sd_backend_is_cpu(state->compute_backend)) ||
-            !compute_backend_supports_param(*state)) {
+        if (state->usage_op == GGML_OP_CUSTOM && !sd_backend_is_cpu(state->compute_backend)) {
             continue;
         }
         const bool compute_resident =
@@ -1794,7 +1792,14 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
         }
         // Vulkan's heap budget subtraction can underflow when usage exceeds the budget.
         if (total_bytes > 0 && free_bytes > total_bytes && sd_backend_is(backend, "Vulkan")) {
-            return size_t{0};
+            if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                return size_t{0};
+            }
+            // A wrapped report may reflect real pressure; reclaim before accepting the tracked estimate.
+            LOG_VERBOSE("ignoring impossible free memory report on %s (%.2f MB free / %.2f MB total), using tracked residency",
+                           ggml_backend_name(backend), free_bytes / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0));
+            free_bytes                  = total_bytes;
+            result.requires_reclamation = true;
         }
         if (total_bytes > 0) {
             free_bytes = std::min(free_bytes, resident < total_bytes ? total_bytes - resident : 0);
@@ -1840,8 +1845,11 @@ bool ModelManager::fits_compute_backend_capacity(
     const DeviceMemoryRequest& request,
     const std::vector<ggml_tensor*>& required_params) const {
     std::vector<TensorState*> states;
-    return resolve_required_tensor_states(required_params, states, request.compute_backend) &&
-           check_capacity(request, states).fits();
+    if (!resolve_required_tensor_states(required_params, states, request.compute_backend)) {
+        return false;
+    }
+    const auto capacity = check_capacity(request, states);
+    return !capacity.requires_reclamation && capacity.fits();
 }
 
 bool ModelManager::ensure_compute_backend_capacity(
@@ -1863,7 +1871,10 @@ bool ModelManager::ensure_compute_backend_capacity(
         return true;
     }
 
-    auto fits = [&]() { return check_capacity(request, required_states).fits(); };
+    auto fits = [&]() {
+        const auto capacity = check_capacity(request, required_states);
+        return !capacity.requires_reclamation && capacity.fits();
+    };
     if (fits()) {
         return true;
     }
@@ -1903,7 +1914,12 @@ bool ModelManager::ensure_compute_backend_capacity(
             eviction_states.insert(state);
         }
     };
+    size_t last_eviction_count   = 0;
     auto release_eviction_states = [&]() {
+        if (eviction_states.size() == last_eviction_count) {
+            return false;
+        }
+        last_eviction_count = eviction_states.size();
         release_compute_staging_blocks(false, &eviction_states);
         release_params_storage_blocks(false, &eviction_states);
         return fits();
@@ -1941,6 +1957,52 @@ bool ModelManager::ensure_compute_backend_capacity(
         }
     }
 
+    // The loader retains mmap buffers after storage blocks are released, so
+    // demoting mapped states would only force duplicate allocations on reload.
+    std::unordered_set<TensorState*> mapped_states;
+    for (const auto& block : params_storage_blocks_) {
+        if (!block->mmap_tensor_stores.empty()) {
+            mapped_states.insert(block->states.begin(), block->states.end());
+        }
+    }
+    std::unordered_set<TensorState*> required_set(required_states.begin(), required_states.end());
+    std::vector<TensorState*> demoted_states;
+    auto revert_demotions = [&]() {
+        for (TensorState* state : demoted_states) {
+            if (state->loaded_to_params_backend) {
+                state->residency_mode = ResidencyMode::ParamBackend;
+            }
+        }
+    };
+    auto can_demote_to_disk = [&](TensorState* state) {
+        return state != nullptr && state->tensor != nullptr && state->tensor->view_src == nullptr &&
+               state->residency_mode == ResidencyMode::ParamBackend &&
+               state->params_backend != nullptr && state->params_backend == state->compute_backend &&
+               state->compute_backend == compute_backend && !sd_backend_is_cpu(state->params_backend) &&
+               state->pin_count == 0 && !state->staged_to_compute_backend && state->loaded_to_params_backend &&
+               protected_states.find(state) == protected_states.end() &&
+               required_set.find(state) == required_set.end() &&
+               mapped_states.find(state) == mapped_states.end() &&
+               !state->sources.empty() && state->applied_lora_epoch == UINT64_MAX &&
+               state->split_buffer_type == nullptr;
+    };
+    for (TensorState* state : global_candidates) {
+        if (!can_demote_to_disk(state)) {
+            continue;
+        }
+        state->residency_mode = ResidencyMode::Disk;
+        demoted_states.push_back(state);
+        add_evictable_state(state);
+        if (release_eviction_states()) {
+            revert_demotions();
+            return true;
+        }
+    }
+    revert_demotions();
+
+    if (check_capacity(request, required_states).fits()) {
+        return true;
+    }
     const auto capacity                = check_capacity(request, required_states, true);
     const std::string available_device = capacity.available_device_bytes == SIZE_MAX
                                              ? "unknown"
