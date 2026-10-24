@@ -1,0 +1,183 @@
+name: Linux x64 CUDA
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish a GitHub Release containing the Linux x64 CUDA package"
+        type: boolean
+        required: true
+        default: false
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/linux-x64-cuda.yml"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "src/**"
+      - "examples/**"
+      - "ggml"
+  pull_request:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/linux-x64-cuda.yml"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "src/**"
+      - "examples/**"
+      - "ggml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-x64-cuda-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PACKAGE_NAME: stable-diffusion-linux-x64-cuda12.zip
+  CUDA_ROOT: /usr/local/cuda-12.8
+
+jobs:
+  build:
+    name: Build and package Linux x64 CUDA
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout (including ggml)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build curl ca-certificates zip unzip file binutils
+
+      # Install CUDA developer packages only. The CI machine has no NVIDIA GPU
+      # or driver, and neither is needed to compile kernels for known SM targets.
+      - name: Install CUDA 12.8 compiler and cuBLAS
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSLo "$RUNNER_TEMP/cuda-keyring.deb" \
+            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i "$RUNNER_TEMP/cuda-keyring.deb"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-12-8 cuda-cudart-dev-12-8 libcublas-dev-12-8 cuda-cccl-12-8
+          "$CUDA_ROOT/bin/nvcc" --version
+
+      - name: Configure Linux CUDA
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CUDACXX="$CUDA_ROOT/bin/nvcc"
+          cmake -S . -B build-linux-cuda -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSD_CUDA=ON \
+            -DSD_BUILD_SHARED_LIBS=ON \
+            -DSD_BUILD_SHARED_GGML_LIB=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DSD_SERVER_BUILD_FRONTEND=OFF \
+            '-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            '-DCMAKE_INSTALL_RPATH=$ORIGIN'
+          grep -q '^SD_CUDA:BOOL=ON$' build-linux-cuda/CMakeCache.txt
+
+      - name: Build sd-server and sd-cli
+        shell: bash
+        run: cmake --build build-linux-cuda --target sd-server sd-cli --parallel 2
+
+      - name: Verify Linux CUDA binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=build-linux-cuda/bin
+          test -x "$bin/sd-server"
+          test -x "$bin/sd-cli"
+          test -n "$(find "$bin" -maxdepth 1 -name 'libggml-cuda.so*' -print -quit)"
+          file "$bin/sd-server" "$bin/sd-cli" "$bin"/libggml-cuda.so*
+          readelf -d "$bin/sd-server" | grep -E '(RPATH|RUNPATH)'
+
+      - name: Stage redistributable Linux CUDA package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p package
+          cp -a build-linux-cuda/bin/. package/
+          cp LICENSE package/stable-diffusion.cpp.txt
+          cp ggml/LICENSE package/ggml.txt
+
+          # Resolve symlinks into regular files: zip tools do not always restore
+          # the soname links, and the app extracts these into its own directory.
+          cuda_lib="$CUDA_ROOT/targets/x86_64-linux/lib"
+          for lib in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
+            test -f "$cuda_lib/$lib"
+            cp -L "$cuda_lib/$lib" "package/$lib"
+          done
+          # Copy optional CUDA runtime dependencies if the toolkit provides them.
+          for lib in libnvJitLink.so.12 libnvrtc.so.12; do
+            if test -f "$cuda_lib/$lib"; then
+              cp -L "$cuda_lib/$lib" "package/$lib"
+            fi
+          done
+          if test -f "$CUDA_ROOT/EULA.txt"; then
+            cp "$CUDA_ROOT/EULA.txt" package/NVIDIA-CUDA-EULA.txt
+          fi
+
+          # Check the bundled libraries can be resolved without a CUDA toolkit
+          # installed on the consuming machine. A GPU/driver is not present in CI.
+          LD_LIBRARY_PATH="$PWD/package" ldd package/libggml-cuda.so | tee cuda-dependencies.txt
+          if grep -E 'lib(cublas|cudart|nvJitLink|nvrtc).*not found' cuda-dependencies.txt; then
+            echo "CUDA shared library dependency is missing from package" >&2
+            exit 1
+          fi
+          (cd package && zip -q -y -r "../$PACKAGE_NAME" .)
+          unzip -l "$PACKAGE_NAME" | grep -E '(sd-server|sd-cli|libggml-cuda|libcudart|libcublas)'
+
+      - name: Upload Linux CUDA ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-diffusion-linux-x64-cuda12
+          path: ${{ env.PACKAGE_NAME }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  publish:
+    name: Publish Linux CUDA Release
+    needs: build
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download the built ZIP
+        uses: actions/download-artifact@v4
+        with:
+          name: stable-diffusion-linux-x64-cuda12
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA:0:7}"
+          gh release create "linux-cuda12-$short" "$PACKAGE_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Linux x64 CUDA 12.8 $short" \
+            --notes "Linux x86_64 stable-diffusion.cpp CUDA 12.8 build. Includes sd-server, sd-cli, GGML CUDA backend, and CUDA/cuBLAS runtime libraries. Requires an NVIDIA GPU with a compatible NVIDIA driver; not GPU-tested on CI." \
+            --latest=false
