@@ -112,7 +112,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p package
-          cp -a build-linux-cuda/bin/. package/
+          # .NET ZIP extraction writes symlink targets as text files, so every
+          # library alias (including WebP and GGML) must contain the library bytes.
+          cp -aL build-linux-cuda/bin/. package/
           cp LICENSE package/stable-diffusion.cpp.txt
           cp ggml/LICENSE package/ggml.txt
 
@@ -140,8 +142,50 @@ jobs:
             echo "CUDA shared library dependency is missing from package" >&2
             exit 1
           fi
-          (cd package && zip -q -y -r "../$PACKAGE_NAME" .)
+          if test -n "$(find package -type l -print -quit)"; then
+            echo "Linux CUDA package must not contain symbolic links" >&2
+            exit 1
+          fi
+          (cd package && zip -q -r "../$PACKAGE_NAME" .)
           unzip -l "$PACKAGE_NAME" | grep -E '(sd-server|sd-cli|libggml-cuda|libcudart|libcublas)'
+
+      - name: Verify extracted Linux CUDA package
+        shell: bash
+        run: |
+          set -euo pipefail
+          extracted="$(mktemp -d)"
+          trap 'rm -rf "$extracted"' EXIT
+          unzip -q "$PACKAGE_NAME" -d "$extracted"
+          if test -n "$(find "$extracted" -type l -print -quit)"; then
+            echo "Linux CUDA ZIP must not contain symbolic links" >&2
+            exit 1
+          fi
+          for lib in "$extracted"/*.so*; do
+            readelf -h "$lib" > /dev/null
+          done
+          # Use the extracted libraries, not the build tree or staging directory.
+          cd "$extracted"
+          export LD_LIBRARY_PATH="$extracted"
+          export LC_ALL=C
+          missing_driver=false
+          for binary in ./sd-server ./sd-cli ./*.so*; do
+            dependencies="$(ldd "$binary")"
+            while IFS= read -r missing; do
+              if test "$missing" = libcuda.so.1; then
+                # The NVIDIA driver is supplied by the user's machine, not the ZIP.
+                missing_driver=true
+              else
+                echo "$binary: missing packaged dependency $missing" >&2
+                exit 1
+              fi
+            done < <(printf '%s\n' "$dependencies" | awk '$2 == "=>" && $3 == "not" && $4 == "found" { print $1 }')
+          done
+          if test "$missing_driver" = true; then
+            echo "Skipping executable startup checks: NVIDIA driver libcuda.so.1 is unavailable on this runner."
+          else
+            ./sd-server --help
+            ./sd-cli --help
+          fi
 
       - name: Upload Linux CUDA ZIP
         uses: actions/upload-artifact@v4
