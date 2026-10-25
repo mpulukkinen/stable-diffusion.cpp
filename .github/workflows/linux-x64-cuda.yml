@@ -166,8 +166,26 @@ jobs:
           # Use the extracted libraries, not the build tree or staging directory.
           cd "$extracted"
           export LD_LIBRARY_PATH="$extracted"
-          ./sd-server --help
-          ./sd-cli --help
+          export LC_ALL=C
+          missing_driver=false
+          for binary in ./sd-server ./sd-cli ./*.so*; do
+            dependencies="$(ldd "$binary")"
+            while IFS= read -r missing; do
+              if test "$missing" = libcuda.so.1; then
+                # The NVIDIA driver is supplied by the user's machine, not the ZIP.
+                missing_driver=true
+              else
+                echo "$binary: missing packaged dependency $missing" >&2
+                exit 1
+              fi
+            done < <(printf '%s\n' "$dependencies" | awk '$2 == "=>" && $3 == "not" && $4 == "found" { print $1 }')
+          done
+          if test "$missing_driver" = true; then
+            echo "Skipping executable startup checks: NVIDIA driver libcuda.so.1 is unavailable on this runner."
+          else
+            ./sd-server --help
+            ./sd-cli --help
+          fi
 
       - name: Upload Linux CUDA ZIP
         uses: actions/upload-artifact@v4
